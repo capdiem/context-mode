@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execSync } from "node:child_process";
 
 const CACHE_TTL_MS = 60_000;
 const FETCH_TIMEOUT_MS = 2_000;
@@ -110,6 +111,117 @@ export function buildUrl(cfg, _eventType) {
   return `${cfg.platform_url}/events`;
 }
 
+// === Project identity resolution — worktree-invariant canonicalization ===
+// Filesystem path is the wrong identifier for "project": git worktrees fork
+// the path while keeping the same repo, monorepos collapse N packages into
+// one umbrella, and forks of the same repo look like different projects.
+// Resolve to a stable identity using:
+//   1. Closest package.json `name` if it lives DEEPER than the .git root
+//      (monorepo sub-package — preserve granularity)
+//   2. git config remote.origin.url, normalized
+//      (worktrees of one repo collapse to one identity)
+//   3. Closest package.json `name` at any depth
+//      (local-only Node project)
+//   4. basename(projectDir) (last resort)
+const _projectIdentityCache = new Map();
+
+function resolveProjectIdentity(projectDir) {
+  if (typeof projectDir !== "string" || !projectDir) return null;
+  if (_projectIdentityCache.has(projectDir)) return _projectIdentityCache.get(projectDir);
+  const id = computeProjectIdentity(projectDir);
+  _projectIdentityCache.set(projectDir, id);
+  return id;
+}
+
+function computeProjectIdentity(projectDir) {
+  let absoluteDir;
+  try {
+    absoluteDir = path.resolve(projectDir);
+  } catch {
+    return null;
+  }
+  const walked = walkUpFromDir(absoluteDir);
+  const pkg = walked.packageJson;
+  const gitTop = walked.gitToplevel;
+
+  // (1) Monorepo sub-package: package.json STRICTLY deeper than .git root.
+  if (pkg && gitTop && pkg.dir !== gitTop && pkg.dir.length > gitTop.length && pkg.name) {
+    return pkg.name;
+  }
+  // (2) Git remote URL.
+  const remote = gitTop ? readGitRemote(gitTop) : null;
+  if (remote) return normalizeRemoteUrl(remote);
+  // (3) Closest package.json (any depth).
+  if (pkg?.name) return pkg.name;
+  // (4) Basename.
+  return path.basename(absoluteDir);
+}
+
+function walkUpFromDir(start) {
+  let dir = start;
+  let pkg = null;
+  let gitTop = null;
+  // Safety: cap walk to 64 levels; real filesystems never hit this.
+  for (let i = 0; i < 64; i++) {
+    if (!pkg) {
+      const pkgPath = path.join(dir, "package.json");
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+          if (typeof parsed?.name === "string" && parsed.name.trim()) {
+            pkg = { dir, name: parsed.name.trim() };
+          }
+        } catch { /* malformed — skip silently */ }
+      }
+    }
+    if (!gitTop && fs.existsSync(path.join(dir, ".git"))) {
+      gitTop = dir;
+    }
+    if (pkg && gitTop) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return { packageJson: pkg, gitToplevel: gitTop };
+}
+
+function readGitRemote(gitTop) {
+  try {
+    const url = execSync("git config --get remote.origin.url", {
+      cwd: gitTop,
+      encoding: "utf8",
+      timeout: 500,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return url || null;
+  } catch {
+    return null;
+  }
+}
+
+// Canonical wire shape: host/path, lowercased host, no scheme, no .git suffix,
+// no embedded credentials. All clone-equivalents collapse to one identity.
+function normalizeRemoteUrl(url) {
+  let u = String(url).trim();
+  // SSH form (git@host:org/repo) → host/org/repo
+  const sshMatch = u.match(/^[a-z0-9_-]+@([^:]+):(.+)$/i);
+  if (sshMatch) {
+    u = `${sshMatch[1]}/${sshMatch[2]}`;
+  } else {
+    // scheme://[user[:pass]@]host/path  →  host/path
+    u = u.replace(/^[a-z]+:\/\/(?:[^@/]+@)?/i, "");
+  }
+  u = u.replace(/\.git\/?$/i, "").replace(/\/+$/, "");
+  // Lowercase host segment only (paths can be case-sensitive)
+  const slash = u.indexOf("/");
+  if (slash > 0) {
+    u = u.slice(0, slash).toLowerCase() + u.slice(slash);
+  } else {
+    u = u.toLowerCase();
+  }
+  return u;
+}
+
 // === Privacy: secret + PII redaction ===
 const SECRETS = [
   /\b(?:ghp|gho|ghs|ghu|github_pat)_[A-Za-z0-9_]{20,}\b/g, // GitHub
@@ -157,7 +269,16 @@ export async function maybeForward(event, platform, opts = {}) {
   const cfg = readConfig();
   if (!cfg) return;
 
-  const ev = sanitizeEvent(event);
+  // Project identity must be resolved from the RAW projectDir — the resolver
+  // reads `git config` against the actual filesystem path. After sanitize,
+  // $HOME-normalization would break the lookup. We overlay the resolved id
+  // back onto the event so the sanitize/walk path sees the canonical value
+  // (URL or package name, which need no further normalization).
+  const resolvedProject = resolveProjectIdentity(event?.projectDir);
+  const eventWithProject = resolvedProject !== null
+    ? { ...event, project: resolvedProject }
+    : event;
+  const ev = sanitizeEvent(eventWithProject);
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
 
@@ -204,6 +325,16 @@ export const _internal = {
   sanitizeEvent,
   privacyTransform,
   configPath,
-  resetState: () => { _cache = null; _cacheLoadedAt = 0; _warned = false; _fsLoads = 0; },
+  resolveProjectIdentity,
+  normalizeRemoteUrl,
+  walkUpFromDir,
+  resetState: () => {
+    _cache = null;
+    _cacheLoadedAt = 0;
+    _warned = false;
+    _fsLoads = 0;
+    _projectIdentityCache.clear();
+  },
   get fsLoads() { return _fsLoads; },
+  get projectIdentityCacheSize() { return _projectIdentityCache.size; },
 };

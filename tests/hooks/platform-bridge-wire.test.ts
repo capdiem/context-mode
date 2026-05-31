@@ -14,6 +14,7 @@ import { describe, test, beforeEach, afterEach, expect, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execSync } from "node:child_process";
 
 interface MockDb {
   getSessionStats: () => { project_dir?: string } | null;
@@ -313,5 +314,196 @@ describe("platform-bridge wire — session-loaders forwards events", () => {
     expect(body).not.toHaveProperty("session_category");
     expect(body).not.toHaveProperty("session_data");
     expect(body).not.toHaveProperty("error");
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// Project identity resolution
+// ─────────────────────────────────────────────────────────
+describe("platform-bridge — project identity resolution", () => {
+  describe("normalizeRemoteUrl", () => {
+    test.each([
+      ["git@github.com:mksglu/context-mode.git", "github.com/mksglu/context-mode"],
+      ["https://github.com/mksglu/context-mode.git", "github.com/mksglu/context-mode"],
+      ["https://github.com/mksglu/context-mode", "github.com/mksglu/context-mode"],
+      ["https://oauth2:TOKEN@github.com/mksglu/private.git", "github.com/mksglu/private"],
+      ["ssh://git@gitlab.example.com/org/sub/repo.git", "gitlab.example.com/org/sub/repo"],
+      // SSH with port-style host: not real ssh URI, but tolerate gracefully
+      ["git@GitHub.COM:Mksglu/Repo.git", "github.com/Mksglu/Repo"],
+    ])("%s → %s", async (input, expected) => {
+      const { bridge } = await importFresh();
+      expect(bridge._internal.normalizeRemoteUrl(input)).toBe(expected);
+    });
+  });
+
+  describe("resolveProjectIdentity", () => {
+    let scratchRoot: string;
+
+    beforeEach(() => {
+      scratchRoot = mkdtempSync(join(tmpdir(), "ctx-project-identity-"));
+    });
+    afterEach(() => {
+      try { rmSync(scratchRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    test("worktree dedup: two worktrees of the same repo collapse to one identity", async () => {
+      const repo = join(scratchRoot, "repo");
+      mkdirSync(repo);
+      execSync(`git init -q && git remote add origin git@github.com:acme/myrepo.git`, {
+        cwd: repo,
+        stdio: "ignore",
+        shell: "/bin/bash",
+      });
+
+      // Same .git → linked worktrees share remote config. Simulate by
+      // pointing two directories' .git files at the same gitdir.
+      const wt1 = join(scratchRoot, "wt1");
+      const wt2 = join(scratchRoot, "wt2");
+      mkdirSync(wt1);
+      mkdirSync(wt2);
+      writeFileSync(join(wt1, ".git"), `gitdir: ${repo}/.git\n`);
+      writeFileSync(join(wt2, ".git"), `gitdir: ${repo}/.git\n`);
+
+      const { bridge } = await importFresh();
+      bridge._internal.resetState();
+
+      const id1 = bridge._internal.resolveProjectIdentity(wt1);
+      const id2 = bridge._internal.resolveProjectIdentity(wt2);
+      const idMain = bridge._internal.resolveProjectIdentity(repo);
+
+      expect(id1).toBe("github.com/acme/myrepo");
+      expect(id2).toBe("github.com/acme/myrepo");
+      expect(idMain).toBe("github.com/acme/myrepo");
+    });
+
+    test("monorepo sub-package: deeper package.json wins over git remote URL", async () => {
+      const root = join(scratchRoot, "mono");
+      const subPkg = join(root, "packages", "api");
+      mkdirSync(subPkg, { recursive: true });
+      execSync(`git init -q && git remote add origin https://github.com/acme/mono.git`, {
+        cwd: root,
+        stdio: "ignore",
+        shell: "/bin/bash",
+      });
+      // Root workspace package.json (umbrella name)
+      writeFileSync(join(root, "package.json"), JSON.stringify({ name: "mono-root" }));
+      // Sub-package — deeper than .git → wins
+      writeFileSync(join(subPkg, "package.json"), JSON.stringify({ name: "@acme/api" }));
+
+      const { bridge } = await importFresh();
+      bridge._internal.resetState();
+
+      expect(bridge._internal.resolveProjectIdentity(subPkg)).toBe("@acme/api");
+      expect(bridge._internal.resolveProjectIdentity(root)).toBe("github.com/acme/mono");
+    });
+
+    test("local-only project (no git, has package.json): package name wins", async () => {
+      const dir = join(scratchRoot, "local");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "scratch-toy" }));
+
+      const { bridge } = await importFresh();
+      bridge._internal.resetState();
+      expect(bridge._internal.resolveProjectIdentity(dir)).toBe("scratch-toy");
+    });
+
+    test("no git + no package.json: basename fallback", async () => {
+      const dir = join(scratchRoot, "naked-dir-xyz");
+      mkdirSync(dir);
+
+      const { bridge } = await importFresh();
+      bridge._internal.resetState();
+      expect(bridge._internal.resolveProjectIdentity(dir)).toBe("naked-dir-xyz");
+    });
+
+    test("cache: second resolution for same dir uses cache (no re-walk)", async () => {
+      const dir = join(scratchRoot, "cached");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "cache-pkg" }));
+
+      const { bridge } = await importFresh();
+      bridge._internal.resetState();
+
+      expect(bridge._internal.projectIdentityCacheSize).toBe(0);
+      bridge._internal.resolveProjectIdentity(dir);
+      expect(bridge._internal.projectIdentityCacheSize).toBe(1);
+      bridge._internal.resolveProjectIdentity(dir);
+      // Same dir → no new entry.
+      expect(bridge._internal.projectIdentityCacheSize).toBe(1);
+    });
+  });
+
+  describe("integration: session-loaders → maybeForward → resolved project", () => {
+    let scratchRoot: string;
+    let fakeHome: string;
+    let origHome: string | undefined;
+    let origXdg: string | undefined;
+    let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      scratchRoot = mkdtempSync(join(tmpdir(), "ctx-bridge-integration-"));
+      fakeHome = mkdtempSync(join(tmpdir(), "ctx-bridge-integration-home-"));
+      origHome = process.env.HOME;
+      origXdg = process.env.XDG_CONFIG_HOME;
+      process.env.HOME = fakeHome;
+      delete process.env.XDG_CONFIG_HOME;
+      fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(null, { status: 200 }),
+      );
+    });
+
+    afterEach(() => {
+      if (origHome !== undefined) process.env.HOME = origHome;
+      else delete process.env.HOME;
+      if (origXdg !== undefined) process.env.XDG_CONFIG_HOME = origXdg;
+      else delete process.env.XDG_CONFIG_HOME;
+      try { rmSync(scratchRoot, { recursive: true, force: true }); } catch {}
+      try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+      vi.doUnmock("../../hooks/platform-bridge.mjs");
+      vi.resetModules();
+      vi.restoreAllMocks();
+    });
+
+    test("worktree path on the wire becomes the canonical remote URL", async () => {
+      const repo = join(scratchRoot, "repo");
+      mkdirSync(repo);
+      execSync(`git init -q && git remote add origin git@github.com:mksglu/context-mode.git`, {
+        cwd: repo,
+        stdio: "ignore",
+        shell: "/bin/bash",
+      });
+
+      mkdirSync(join(fakeHome, ".context-mode"), { recursive: true });
+      writeFileSync(
+        join(fakeHome, ".context-mode", "platform.json"),
+        JSON.stringify({
+          api_key: "ctxm_resolve_test",
+          platform_url: "https://example.test/api/v1",
+        }),
+      );
+
+      const { loaders } = await importFresh();
+      const db = makeMockDb();
+
+      // Attribution returns the worktree path — bridge MUST canonicalize.
+      const attribsAtWorktree = (evs: { type: string }[]) =>
+        evs.map(() => ({ projectDir: repo }));
+
+      loaders.attributeAndInsertEvents(
+        db,
+        "s",
+        [{ type: "tool_use", category: "edit", data: "x" }],
+        { workspace_roots: [repo] },
+        repo,
+        "PostToolUse",
+        attribsAtWorktree,
+      );
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(fetchSpy).toHaveBeenCalled();
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body as string);
+      expect(body.project).toBe("github.com/mksglu/context-mode");
+    });
   });
 });

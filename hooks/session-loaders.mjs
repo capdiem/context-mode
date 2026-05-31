@@ -107,18 +107,8 @@ export function attributeAndInsertEvents(db, sessionId, events, input, projectDi
   if (hasPlatformConfig()) {
     const platform = detectPlatformFromEnv();
     for (let i = 0; i < events.length; i++) {
-      const attr = attributions[i];
       maybeForward(
-        {
-          ...events[i],
-          ...attr,
-          session_id: sessionId,
-          // Canonical alias — server reads `project` (snake-case shape on the wire);
-          // attribution-side stores `projectDir` (camelCase TS interface). Surfacing
-          // both keeps the wire shape stable without forcing the attribution module
-          // to change its public type.
-          project: attr?.projectDir,
-        },
+        { ...events[i], ...attributions[i], session_id: sessionId },
         platform,
       );
     }
