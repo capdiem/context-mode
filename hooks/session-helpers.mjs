@@ -215,6 +215,24 @@ export const KIMI_OPTS = {
   sessionIdEnv: undefined,    // Uses session_id from hook stdin or ppid fallback
 };
 
+/**
+ * Qoder CLI platform options.
+ *
+ * Qoder CLI uses ~/.qoder/settings.json + .qoder/settings.json + .qoder/settings.local.json
+ * (multi-level merge). The configDirEnv is intentionally omitted — Qoder CLI has no
+ * RELOCATABLE_HOME equivalent (config is always ~/.qoder). Session ID is derived from
+ * the hook stdin `session_id` field rather than an env var, but QODER_SESSION_ID is
+ * injected by the Qoder CLI runtime for reference.
+ *
+ * Doc ref: https://docs.qoder.com/en/cli/hooks.md#environment-variables
+ */
+export const QODER_CLI_OPTS = {
+  configDir: ".qoder",
+  configDirEnv: undefined,
+  projectDirEnv: "QODER_PROJECT_DIR",
+  sessionIdEnv: "QODER_SESSION_ID",
+};
+
 /** JetBrains Copilot platform options. */
 export const JETBRAINS_OPTS = {
   configDir: ".config/JetBrains",

@@ -217,6 +217,11 @@ const _PLATFORM_ENV_VARS_RAW: ReadonlyArray<readonly [PlatformId, readonly Platf
   ["qwen-code", [
     { name: "QWEN_PROJECT_DIR", role: "workspace" },
   ]],
+  // qodercli — Qoder CLI sets QODER_PROJECT_DIR in hook context.
+  // Listed after other CLI agents, before host IDEs.
+  ["qodercli", [
+    { name: "QODER_PROJECT_DIR", role: "workspace" },
+  ]],
   // omp (can1357/oh-my-pi). PI_CODING_AGENT_DIR is the upstream
   // agent-dir override per `packages/utils/src/dirs.ts:193`. Listed
   // BEFORE pi so OMP is not misclassified as Pi when both are installed.
@@ -349,6 +354,7 @@ export function getSessionDirSegments(platform: string): string[] | null {
     case "pi":               return [".pi"];
     case "omp":              return [".omp"];
     case "qwen-code":        return [".qwen"];
+    case "qodercli":        return [".qoder"];
     case "kimi":             return [".kimi-code"];
     case "kilo":             return [".config", "kilo"];
     case "opencode":         return [".config", "opencode"];
@@ -390,7 +396,7 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
   if (platformOverride) {
     const validPlatforms: PlatformId[] = [
       "claude-code", "gemini-cli", "kilo", "opencode", "codex",
-      "vscode-copilot", "jetbrains-copilot", "copilot-cli", "cursor", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "kimi",
+      "vscode-copilot", "jetbrains-copilot", "copilot-cli", "cursor", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "kimi", "qodercli",
     ];
     if (validPlatforms.includes(platformOverride as PlatformId)) {
       return {
@@ -564,6 +570,18 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
+  // qodercli — CLI agent sharing ~/.qoder/ with Qoder IDE.
+  // At medium confidence, both IDE and CLI land here. The high-confidence
+  // env-var tier above distinguishes the two: QODER_PROJECT_DIR → CLI,
+  // QODER_AGENT → IDE.
+  if (existsSync(resolve(home, ".qoder"))) {
+    return {
+      platform: "qodercli",
+      confidence: "medium",
+      reason: "~/.qoder/ directory exists",
+    };
+  }
+
   if (existsSync(resolve(home, ".kimi-code"))) {
     return {
       platform: "kimi",
@@ -725,6 +743,11 @@ export async function getAdapter(platform?: PlatformId): Promise<HookAdapter> {
     case "kimi": {
       const { KimiAdapter } = await import("./kimi/index.js");
       return new KimiAdapter();
+    }
+
+    case "qodercli": {
+      const { QodercliAdapter } = await import("./qodercli/index.js");
+      return new QodercliAdapter();
     }
 
     default: {

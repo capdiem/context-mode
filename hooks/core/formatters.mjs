@@ -226,6 +226,58 @@ export const formatters = {
     context: () => null, // Kimi HookResult has no additionalContext field
   },
 
+  "qodercli": {
+    // Qoder CLI uses the same hookSpecificOutput + hookEventName format as
+    // Claude Code. Doc ref: https://docs.qoder.com/en/cli/hooks.md#pretooluse
+    deny: (reason) => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: reason,
+      },
+    }),
+    ask: () => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+      },
+    }),
+    // Qoder CLI supports updatedInput inside hookSpecificOutput for
+    // non-Bash tools (Read/Write/Edit arg modification). Bash commands
+    // with "command" in updatedInput follow the same echo→deny conversion
+    // as Claude Code — emit deny + redirect guidance in permissionDecisionReason.
+    modify: (updatedInput) => {
+      const ui = updatedInput ?? {};
+      const isBashRedirect = "command" in ui;
+      if (!isBashRedirect) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            updatedInput: ui,
+          },
+        };
+      }
+      const cmd = ui.command ?? "";
+      const m = cmd.match(/^echo\s+"(.+)"$/s);
+      const reason = m
+        ? m[1]
+        : "Redirected to ctx_execute / ctx_fetch_and_index. Call ctx_execute(language, code) to fetch and derive your answer in one round trip, or call ctx_fetch_and_index(url, source) when you want to query the response later via ctx_search. Both have full network access.";
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: reason,
+        },
+      };
+    },
+    context: (additionalContext) => ({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext,
+      },
+    }),
+  },
+
   "antigravity-cli": {
     // agy PreToolUse accepts the Claude-compatible top-level decision shape.
     // agy 1.0.6 does NOT honor PreToolUse additionalContext (verified by

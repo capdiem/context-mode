@@ -129,6 +129,14 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     userpromptsubmit: "hooks/copilot-cli/userpromptsubmit.mjs",
     stop: "hooks/copilot-cli/stop.mjs",
   },
+  // Qoder CLI — PreToolUse (routing), PostToolUse (capture-only),
+  // UserPromptSubmit (passthrough), Stop (passthrough).
+  "qodercli": {
+    pretooluse: "hooks/qodercli/pretooluse.mjs",
+    posttooluse: "hooks/qodercli/posttooluse.mjs",
+    userpromptsubmit: "hooks/qodercli/userpromptsubmit.mjs",
+    stop: "hooks/qodercli/stop.mjs",
+  },
   // Antigravity CLI (`agy`) — bounded PreToolUse enforcement plus capture-only
   // PostToolUse/Stop hooks. Configured via an installed agy plugin's
   // hooks/hooks.json or ~/.gemini/config/hooks.json.

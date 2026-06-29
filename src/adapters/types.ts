@@ -490,6 +490,7 @@ export type PlatformId =
   | "kimi"
   | "zed"
   | "qwen-code"
+  | "qodercli"
   | "unknown";
 
 /** Detection signal used to identify which platform is running. */
