@@ -1388,6 +1388,67 @@ export function getRealBytesStats(opts: {
   return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
 }
 
+/**
+ * v1.0.169 — Section 1 "Where you are now" = the LIVE conversation window.
+ *
+ * A single live conversation fans out into sub-agents and ctx_execute
+ * sub-process sessions. Each runs in its OWN, disposable context window (its
+ * own session_id) — but all under the SAME worktree DB, because the worktree
+ * hash is sha256(cwd) and they share the cwd. Their retrieval (ctx_search /
+ * ctx_fetch_and_index returns) entered THOSE windows and was thrown away when
+ * each returned its short summary; it never touched the window the user is
+ * reading now. So the live-window savings bar must split the worktree by
+ * which retrieval actually landed in the user's window:
+ *
+ *   bytesReturned ("With context-mode")  = THIS session's retrieval only —
+ *       what genuinely entered the live window.
+ *   bytesAvoided  ("kept out")           = everything the whole worktree moved
+ *       (avoided + every session's retrieval) MINUS what landed in your window.
+ *
+ * Scoping by `worktreeHash` (not project-root + time) means the user's OTHER
+ * parallel worktrees never bleed in — a different worktree is a different
+ * cwd-hash, hence a different DB file the prefix filter excludes — while the
+ * sub-agent fan-out this conversation actually spawned is fully credited.
+ */
+export function getConversationWindowStats(opts: {
+  sessionId: string;
+  worktreeHash: string;
+  sessionsDir?: string;
+  contentDbPath?: string;
+}): RealBytesStats {
+  // Whole current worktree: every session that shares this cwd-hash DB.
+  const pool = getRealBytesStats({
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+  });
+  // Just the live window: this session_id (folds its own ctx_search/ctx_fetch
+  // retrieval + content chunks).
+  const mine = getRealBytesStats({
+    sessionId: opts.sessionId,
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+    contentDbPath: opts.contentDbPath,
+  });
+
+  const windowReturned = mine.bytesReturned;
+  const movedTotal = pool.bytesAvoided + pool.bytesReturned;
+  // What context-mode kept OUT of the live window = everything moved across the
+  // worktree minus the slice that actually entered this window. Clamp at 0 so a
+  // stale/edge DB can never produce a negative bar.
+  const keptOut = Math.max(0, movedTotal - windowReturned);
+
+  return {
+    eventDataBytes: pool.eventDataBytes,
+    bytesAvoided: keptOut,
+    bytesReturned: windowReturned,
+    snapshotBytes: pool.snapshotBytes,
+    contentBytes: mine.contentBytes,
+    totalSavedTokens: Math.floor(
+      (pool.eventDataBytes + keptOut + pool.snapshotBytes) / 4,
+    ),
+  };
+}
+
 // ─────────────────────────────────────────────────────────
 // Multi-adapter aggregation (B3a — "your work everywhere")
 // ─────────────────────────────────────────────────────────
@@ -2155,7 +2216,7 @@ function renderNarrative5Section(args: {
     const convMult   = Math.max(1, Math.round(convTokensWithout / convTokensWith));
     out.push(`  Without context-mode  ${kb(convBytesWithout).padStart(8)}  ${withoutBar}   ${fmtNum(convTokensWithout).padStart(7)} tokens`);
     out.push(`  With context-mode     ${kb(convBytesWith).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
-    out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
+    out.push(`                          ${convPct.toFixed(1)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
     out.push("");
   }
 

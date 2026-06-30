@@ -29,6 +29,7 @@ import { SessionDB } from "../../src/session/db.js";
 import {
   formatReport,
   getContentBytesForSession,
+  getConversationWindowStats,
   getMultiAdapterRealBytesStats,
   getRealBytesStats,
 } from "../../src/session/analytics.js";
@@ -100,6 +101,58 @@ function seed(
     sdb.close();
   }
 }
+
+describe("getConversationWindowStats (v1.0.169 live-window framing)", () => {
+  test("splits the worktree: kept-out = whole worktree moved minus THIS window's retrieval; With = this session only", () => {
+    const dir = mkSessionsDir();
+    const hash = "feedfacefeedface";
+    const db = dbPathFor(dir, hash);
+    const main = `main-${randomUUID()}`;
+    const sub = `sub-${randomUUID()}`;
+
+    // Live window (main): avoided 600k, pulled 10k of retrieval into context.
+    seed(db, main,
+      [{ type: "cache-hit", category: "cache", data: "https://a", bytesAvoided: 600_000 }],
+      undefined,
+      [{ tool: "ctx_search", bytesReturned: 10_000 }]);
+    // Sub-agent (same worktree DB, own session): avoided 1.9M, retrieved 500k
+    // into ITS OWN disposable window — never the live window.
+    seed(db, sub,
+      [{ type: "cache-hit", category: "cache", data: "https://b", bytesAvoided: 1_900_000 }],
+      undefined,
+      [{ tool: "ctx_search", bytesReturned: 500_000 }]);
+
+    const r = getConversationWindowStats({ sessionId: main, worktreeHash: hash, sessionsDir: dir });
+
+    // "With context-mode" = ONLY what entered the live window (main's retrieval).
+    expect(r.bytesReturned).toBe(10_000);
+    // "kept out" = whole worktree moved (600k+1.9M avoided + 510k retrieval)
+    //              minus the 10k that landed in the live window = 3,000,000.
+    expect(r.bytesAvoided).toBe(3_000_000);
+    // The bar's "Without context-mode" = avoided + returned = total worktree
+    // bytes moved = 3,010,000. Sub-agent retrieval is credited as kept-out,
+    // not charged to the user's window.
+    expect(r.bytesAvoided + r.bytesReturned).toBe(3_010_000);
+  });
+
+  test("excludes the user's OTHER parallel worktrees (different cwd-hash = different DB file)", () => {
+    const dir = mkSessionsDir();
+    const mine = "aaaabbbbccccdddd";
+    const other = "1111222233334444";
+    const main = `main-${randomUUID()}`;
+
+    seed(dbPathFor(dir, mine), main,
+      [{ type: "cache-hit", category: "cache", data: "https://mine", bytesAvoided: 800_000 }]);
+    // A concurrent worktree the user is also working in — MUST NOT bleed in.
+    seed(dbPathFor(dir, other), `other-${randomUUID()}`,
+      [{ type: "cache-hit", category: "cache", data: "https://other", bytesAvoided: 5_000_000 }]);
+
+    const r = getConversationWindowStats({ sessionId: main, worktreeHash: mine, sessionsDir: dir });
+
+    // Only the current worktree's 800k counts; the other worktree's 5M is gone.
+    expect(r.bytesAvoided).toBe(800_000);
+  });
+});
 
 describe("getRealBytesStats (Phase 8 renderer source-of-truth)", () => {
   test("8.1 conversation tier: sums data + bytes_avoided + bytes_returned + snapshot for one session", () => {
@@ -772,7 +825,7 @@ describe("v1.0.148 Bug G — strict-compression formula (Section 1 Without/With)
     // Locate the "kept out of context" ratio line.
     const ratioLine = lines.find((l) => /kept out of context/.test(l));
     expect(ratioLine, `ratio line missing:\n${text}`).toBeDefined();
-    const m = ratioLine!.match(/(\d+)%\s+kept out of context/);
+    const m = ratioLine!.match(/(\d+(?:\.\d+)?)%\s+kept out of context/);
     expect(m, `cannot parse ratio: ${ratioLine}`).not.toBeNull();
     const pct = Number(m![1]);
 
