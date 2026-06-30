@@ -82,6 +82,12 @@ describe("getToolName", () => {
     );
   });
 
+  it("returns correct name for qodercli", () => {
+    expect(getToolName("qodercli", "ctx_execute")).toBe(
+      "mcp__context_mode__ctx_execute",
+    );
+  });
+
   it("returns correct name for antigravity", () => {
     expect(getToolName("antigravity", "ctx_execute")).toBe(
       "mcp__context-mode__ctx_execute",
@@ -167,6 +173,7 @@ describe("KNOWN_PLATFORMS", () => {
     expect(KNOWN_PLATFORMS).toContain("openclaw");
     expect(KNOWN_PLATFORMS).toContain("pi");
     expect(KNOWN_PLATFORMS).toContain("qwen-code");
+    expect(KNOWN_PLATFORMS).toContain("qodercli");
     expect(KNOWN_PLATFORMS.length).toBeGreaterThanOrEqual(14);
   });
 });
